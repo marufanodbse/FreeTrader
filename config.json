@@ -1,0 +1,26 @@
+{
+    "trains": [
+        {
+            "symbol": "BTC/USDT",
+            "timeframe": "5m",
+            "batch_size": 64,
+            "seq_len": 24,
+            "units": 256,
+            "dropout": 0.5,
+            "learning_rate": 0.001,
+            "days": 180,
+            "offsetSteps":[1, 2, 4]
+        },
+        {
+            "symbol": "BTC/USDT",
+            "timeframe": "15m",
+            "batch_size": 64,
+            "seq_len": 32,
+            "units": 128,
+            "dropout": 0.4,
+            "learning_rate": 0.001,
+            "days": 360,
+            "offsetSteps":[1, 2, 4]
+        }
+    ]
+}
