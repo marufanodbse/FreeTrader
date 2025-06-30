@@ -11,16 +11,23 @@ from datetime import datetime
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 
+import tensorflow as tf
 from tensorflow.keras.layers import Dense, Dropout, Input
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import EarlyStopping
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Conv1D, Dense, Dropout, BatchNormalization, GlobalAveragePooling1D
-
+from tensorflow.keras.layers import (
+    Input, Conv1D, LeakyReLU, BatchNormalization,
+    Dropout, GlobalAveragePooling1D, Dense, Add, LayerNormalization
+)
+from tensorflow.keras.regularizers import l2
 
 from models.lstm.model_utils import load_latest_model, save_model
 from models.lstm.multioutput_early_stopping import MultiOutputEarlyStopping
+
 import optuna
+from optuna.pruners import HyperbandPruner
+from sklearn.metrics import mean_squared_error
 
 early_stopping = EarlyStopping(
     monitor="val_loss", patience=10, restore_best_weights=True
@@ -35,35 +42,29 @@ early_stopping = EarlyStopping(
 
 
 def build_tcn_model(
-    seq_length, n_features, filters, kernel_size, dilations, dropout_rate
+    seq_length, n_features, filters, kernel_size, dilations, dropout_rate, learning_rate, l2_reg
 ):  
     model = Sequential()
-    model.add(Input(shape=(seq_length, n_features))) 
+    model.add(Input(shape=(seq_length, n_features)))
     for i, dilation in enumerate(dilations):
-        if i ==0:
-            model.add(Conv1D(
+        model.add(
+            Conv1D(
                 filters=filters,
                 kernel_size=kernel_size,
                 padding="causal",
                 dilation_rate=dilation,
-                activation="relu",
-                # input_shape=(seq_length, n_features)
-            ))
-        else:
-            model.add(
-                Conv1D(
-                    filters=filters,
-                    kernel_size=kernel_size,
-                    padding="causal",
-                    dilation_rate=dilation,
-                    activation="relu"
-                )
+                kernel_regularizer=l2(l2_reg),
             )
-        model.add(BatchNormalization())
+        )
+        model.add(LayerNormalization())
+        model.add(LeakyReLU(alpha=0.05))
         model.add(Dropout(dropout_rate))
+
+    model.add(Conv1D(filters=filters//2, kernel_size=1, activation="relu"))
+
     model.add(GlobalAveragePooling1D())
-    model.add(Dense(1))
-    model.compile(optimizer=Adam(learning_rate=0.001), loss="mse")
+    model.add(Dense(1))  # 输出一个价格值
+    model.compile(optimizer=Adam(learning_rate=learning_rate), loss="mse")
     return model
 
 
@@ -193,6 +194,8 @@ class TCNModel:
             kernel_size=self.args.get("kernel_size"),
             dilations=[2**i for i in range(self.args.get("n_layers"))],
             dropout_rate=self.args.get("dropout_rate"),
+            learning_rate=self.args.get("learning_rate"),
+            l2_reg=self.args.get("l2_reg"),
         )
 
         # X_train = np.random.randn(100, 60, 16).astype(np.float32)
@@ -201,7 +204,7 @@ class TCNModel:
             X_train,
             y_train,
             epochs=100,
-            batch_size=32,
+            batch_size=self.args.get("batch_size"),
             validation_data=(X_val, y_val),
             verbose=1,
             callbacks=[early_stopping],
@@ -209,25 +212,107 @@ class TCNModel:
         y_val_pred = self.model.predict(X_val, verbose=0)
         return y_val, y_val_pred
 
+    def clean(self):
+        del self.mode
+
     def optimize(self):
 
-       
         df = self.fetch_new_data(
             int(datetime.now().timestamp() - 24 * 3600 * self.args.get("days")) * 1000
         )
-        # self.init_model(df)
 
         def objective(trial):
-            self.args["seq_length"] = trial.suggest_categorical("seq_length", [60])
+            self.args["seq_length"] = trial.suggest_categorical("seq_length", [30, 60, 90, 120])
             self.args["filters"] = trial.suggest_int("filters", 16, 64)
-            self.args["kernel_size"] = trial.suggest_int("kernel_size", 2, 4)
-            self.args["dropout_rate"] = trial.suggest_categorical("dropout_rate",[0.1, 0.2, 0.3, 0.4, 0.5])
-            self.args["n_layers"] = trial.suggest_int("n_layers", 2, 5)
+            self.args["kernel_size"] = trial.suggest_int("kernel_size", 2, 7)
+            self.args["dropout_rate"] = trial.suggest_categorical("dropout_rate", [0.1, 0.2, 0.3, 0.4, 0.5])
+            self.args["n_layers"] = trial.suggest_int("n_layers", 2, 6)
+            self.args["batch_size"] = trial.suggest_categorical("batch_size", [32, 64, 128])
+            self.args["learning_rate"] = trial.suggest_float("learning_rate", 1e-4, 1e-2, log=True)
+            self.args["l2_reg"] = trial.suggest_float("l2_reg", 1e-5, 1e-3, log=True)
+            # self.args["weight_decay"] = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)
+            # self.args["activation"] = trial.suggest_categorical("activation", ["relu", "elu", "gelu"])
 
             y_val, y_val_pred = self.init_model(df)
+            tf.keras.backend.clear_session()
+            import gc
+            gc.collect()
             return mean_squared_error(y_val, y_val_pred)
 
         study = optuna.create_study(direction="minimize")
-        study.optimize(objective, n_trials=10)
+        study.optimize(objective, n_trials=20)
         best_params = study.best_params
         print(f"最佳超参数: {best_params}")
+    
+    def show_prediction_vs_actual(self, days, epochs=50):
+        df = self.fetch_new_data(
+            int(datetime.now().timestamp() - 24 * 3600 * days) * 1000
+        )
+
+        self.init_model(df)
+        x = (
+            pd.to_datetime(df_20["timestamp"], unit="ms")
+            .dt.tz_localize("UTC")
+            .dt.tz_convert("Asia/Shanghai")
+            .iloc[self.window_size - len(df_20) :]
+        )
+
+        x_data, y_data_true = self.create_dataset(df_20)
+        loss_value = self.model.evaluate(x_data, y_data_true, 1)
+
+        # 模型预测（仍是归一化值）
+        y_pred = self.model.predict(x_data)
+        y_pred = y_pred.flatten()
+
+        # 构造 dummy 矩阵来反归一化
+        dummy_pred = np.zeros((len(y_pred), self.scaler.n_features_in_))
+        dummy_true = np.zeros((len(y_data_true), self.scaler.n_features_in_))
+
+        dummy_pred[:, 0] = y_pred
+        dummy_true[:, 0] = y_data_true
+
+        # 反归一化
+        y_pred_real = self.scaler.inverse_transform(dummy_pred)[:, 0]
+        y_true_real = self.scaler.inverse_transform(dummy_true)[:, 0]
+
+        # 绘图
+
+        fig = go.Figure()
+        fig.add_trace(
+            go.Scatter(
+                x=x,
+                y=y_true_real,
+                mode="lines",
+                name="真实价格",
+                line=dict(color="blue"),
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=x,
+                y=y_pred_real,
+                mode="lines",
+                name="预测价格",
+                line=dict(color="red", dash="dash"),
+            )
+        )
+
+        fig.update_layout(
+            title=f"LSTM Prediction vs True {loss_value}",
+            xaxis_title="时间",
+            yaxis_title="价格",
+            legend=dict(x=0, y=1),
+            template="plotly_white",
+            autosize=True,
+            height=500,
+        )
+        import webbrowser, os
+
+        file_path = (
+            f'datas/predictions/{self.symbol.replace("/", "-")}_{self.timeframe}.html'
+        )
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        fig.write_html(file_path)
+
+        webbrowser.open(f"file://{os.path.abspath(file_path)}")

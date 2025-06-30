@@ -4,7 +4,6 @@ import numpy as np
 from sklearn.metrics import mean_squared_error
 from sklearn.preprocessing import MinMaxScaler
 import tensorflow as tf
-import optuna
 from sklearn.model_selection import train_test_split
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -15,6 +14,9 @@ from finance.exchange import Exchange
 from models.lstm.trend_classifier_model import TrendClassifierLstm
 from models.tcn.model import TCNModel
 
+import optuna
+from optuna.pruners import HyperbandPruner
+from sklearn.metrics import mean_squared_error
 # from models.price_model import BaseLSTMModel
 # from models.model_utils import create_dataset, create_model
 
@@ -24,6 +26,16 @@ early_stopping = tf.keras.callbacks.EarlyStopping(
 
 
 def optimize(args):
+    print("TensorFlow version:", tf.__version__)
+    
+    gpus = tf.config.list_physical_devices('GPU')
+    if gpus:
+        try:
+            # 动态显存增长
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+        except RuntimeError as e:
+            print(e)
     # optimize_price_lstm(args)
     TCNModel(args).optimize()
 
@@ -64,7 +76,10 @@ def optimize_tcn(args):
 
         model = TCNModel(args)
         y_val, y_val_pred = model.init_model(df)
-
+        del model
+        tf.keras.backend.clear_session()
+        import gc
+        gc.collect()
         return mean_squared_error(y_val, y_val_pred)
 
     study = optuna.create_study(direction="minimize")
@@ -102,7 +117,7 @@ def optimize_trend_lstm(args):
         return val_acc
 
     storage_path = (
-        f"datas/sqlite/{args["symbol"].replace('/', "-")}_{args["timeframe"]}/"
+        f"datas/sqlite/{args['symbol'].replace('/', '-')}_{args['timeframe']}/"
     )
     storage = f"sqlite:///{storage_path}trend.db"
     os.makedirs(os.path.dirname(storage_path), exist_ok=True)

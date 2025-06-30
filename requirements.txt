@@ -2,9 +2,10 @@ pandas
 numpy
 matplotlib
 scikit-learn
-tensorflow
 ccxt
 apscheduler
 async-timeout
-tensorflow-macos
-tensorflow-metal
+fastapi
+keras_tuner
+cachetools
+optuna
